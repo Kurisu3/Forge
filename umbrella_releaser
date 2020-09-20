@@ -1,0 +1,295 @@
+#!/bin/bash
+
+if [ $# -eq 0 ]; then
+    echo "No arguments supplied. You  have to pass a project path as argument."
+    echo "Ex: umbrella_releaser ./"
+    exit 1
+fi
+
+# get project absolute path
+project_path=$(readlink -f $1)
+
+if ! [ -d $project_path ]; then
+    echo "Provided project path $project_path does not exists on your filesystem."
+    exit 2
+fi
+
+# Get current script absolute dir path
+dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+bgm_dir_path="$dir/bgm/"
+
+audacious --headless $bgm_dir_path &
+last=$?
+
+if [[ $last -ne 0 ]]; then
+    echo "Unable to play background music by running \"audacious --headless $bgm_dir_path\"!"
+    bye
+    exit 3
+fi
+
+function bye {
+    echo "Stoping music and all spawned child processes..."
+    jobs -p | xargs kill
+}
+
+trap bye EXIT
+
+echo "Welcome to the forge! We will generate some files into your new elixir project."
+echo "If there is an existing .forge folder into your project, it will be overwrited."
+read -p "Is that ok for you? " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]
+then
+    exit 4
+fi
+
+# Resolving paths to folder and files to create inside the project dir
+apps_path="$project_path/apps"
+forge_path="$project_path/.forge"
+builder_path="$forge_path/build"
+digester_path="$builder_path/phx"
+env_path="$forge_path/env"
+
+# Remove it if an old ".forge" folder exists
+if [ -d $forge_path ]; then
+    rm -r $forge_path
+fi
+
+mkdir -p $env_path $digester_path
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create directory $forge_path"
+    exit 5
+fi
+
+git_ignore_entry="/.forge"
+git_ignore_file_path="$project_path/.gitignore"
+# Write git entry if not already done
+if ! grep -q $git_ignore_entry $git_ignore_file_path ; then
+    echo "" >> $git_ignore_file_path
+    echo "# This folder shouldn't be tracked" >> $git_ignore_file_path
+    echo $git_ignore_entry >> $git_ignore_file_path
+    echo "Directory $forge_path created and added to $git_ignore_file_path successfully."
+fi
+
+# Generate Phoenix SECRET_BASE_KEY
+cd $project_path
+mix_output=($(mix phx.gen.secret))
+lenght=${#secret[@]}
+secret=${mix_output[length-1]}
+
+if [[ $? -ne 0 ]]; then
+    echo "Unable to run \"mix phx.gen.secret\" inside $project_path!"
+    exit 6
+fi
+
+echo "Phoenix Endpoint Secret base key Generated successfully."
+
+while read -p "Enter database url (Ex: ecto://postgres:postgres@localhost/project_prod): " db_url
+do
+     if [[ -z "${db_url}" ]]; then
+          echo "That was empty, do it again!"
+     else
+          break
+     fi
+done
+
+read -p "Provide smtp server or press enter to use default: [$SMTP_SERVER] " smtp_srv
+if [[ -z "${smtp_srv}" ]]; then
+    smtp_srv="$SMTP_SERVER"
+fi
+
+read -p "Provide smtp user or press enter to use default: [$SMTP_USER] " smtp_user
+if [[ -z "${smtp_user}" ]]; then
+    smtp_user="$SMTP_USER"
+fi
+
+read -p "Provide smtp password or press enter to use default: [$SMTP_PASS] " smtp_pass
+if [[ -z "${smtp_pass}" ]]; then
+    smtp_pass="$SMTP_PASS"
+fi
+
+read -p "Provide uploads and cache path or press enter to use: [/home/prod] " storage_path
+if [[ -z "${storage_path}" ]]; then
+    storage_path="/home/prod"
+fi
+
+env_file_path="$env_path/release.env"
+
+cat > $env_file_path <<EOF
+#!/bin/bash
+
+# Some env vars to set before building releases
+
+export DATABASE_URL=$db_url
+
+export SMTP_SERVER=$smtp_srv
+export SMTP_USER=$smtp_user
+export SMTP_PASS=$smtp_pass
+
+export SECRET_KEY_BASE=$secret
+
+export ELIXIR_STORAGE_PATH=$storage_path
+
+export MIX_ENV=prod
+EOF
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create $env_file_path!"
+    exit 7
+fi
+echo "$env_file_path created successfully."
+
+while read -p "Now enter names of your Phoenix apps separated with a space (Ex: front admin): " apps
+do
+     if [[ -z "${apps}" ]]; then
+          echo "That was empty, do it again!"
+     else
+          break
+     fi
+done
+
+compiler_file_path="$builder_path/compiler"
+cat > $compiler_file_path <<EOF
+#!/bin/bash
+
+cd $project_path
+
+echo "Fetching project dependencies..."
+mix deps.get --only prod
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to get project dependencies!"
+    exit 1
+fi
+echo "Project dependencies fetched successfully."
+
+echo "Compiling project..."
+MIX_ENV=prod mix compile
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to compile project!"
+    exit 2
+fi
+echo "The project has been compiled successfully."
+EOF
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create $compiler_file_path!"
+    exit 8
+fi
+chmod +x $compiler_file_path
+echo "$compiler_file_path created successfully."
+
+for app in ${apps[@]}; do
+digester_file_path="$digester_path/$app"
+app_path="$apps_path/$app"
+cat > $digester_file_path <<EOF
+#!/bin/bash
+
+cd "$app_path/assets"
+echo "Installing $app javascript dependencies..."
+npm install
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to install javascript dependencies!"
+    exit 3
+fi
+echo "Dependencies installed successfully."
+
+echo "Auditing $app javascript dependencies..."
+npm audit fix
+
+echo "Compiling $app assets..."
+npm run deploy
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to compile assets!"
+    exit 4
+fi
+
+cd ..
+echo "Creating $app digest files..."
+mix phx.digest
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to create digest files for $app!"
+    exit 5
+fi
+echo "Assets compiled successfully."
+EOF
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create $digester_file_path!"
+    exit 9
+fi
+chmod +x $digester_file_path
+echo "$digester_file_path created successfully."
+done
+
+releaser_file_path="$builder_path/releaser"
+cat > $releaser_file_path <<EOF
+#!/bin/bash
+
+cd $project_path
+
+echo "Building project release..."
+MIX_ENV=prod mix release --overwrite
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to build project release!"
+    exit 6
+fi
+echo "The project release has been built successfully."
+EOF
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create $releaser_file_path!"
+    exit 10
+fi
+chmod +x $releaser_file_path
+echo "$releaser_file_path created successfully."
+
+supervisor_file_path="$builder_path/supervisor"
+cat > $supervisor_file_path <<EOF
+#!/bin/bash
+
+audacious --headless $bgm_dir_path &
+if [[ \$? -ne 0 ]]; then
+    echo "Unable to play music in $bgm_dir_path with audacious --headless."
+    exit 7
+fi
+
+function bye {
+    echo "Stoping music and all spawned child processes..."
+    jobs -p | xargs kill
+}
+trap bye EXIT
+
+echo "Welcome to the forge that shapes your Elixir projects releases!"
+echo "If there is an existing release version, it will be overwrited."
+read -p "Is that ok for you? " -n 1 -r
+echo
+if [[ ! \$REPLY =~ ^[Yy]\$ ]]
+then
+    exit 8
+fi
+
+# exit when any of the below scripts fails
+set -e
+
+# Set env vars
+source $env_file_path
+
+# Compile project
+$compiler_file_path
+
+# Compile Phoenix assets
+if [ -d $digester_path ]; then
+  for file in $digester_path/*; do
+    if [ -r \$file ]; then
+      \$file
+    fi
+  done
+fi
+
+# Build release
+$releaser_file_path
+EOF
+if [[ $? -ne 0 ]]; then
+    echo "Unable to create $supervisor_file_path!"
+    exit 11
+fi
+chmod +x $supervisor_file_path
+echo "$supervisor_file_path created successfully."
+echo "Congratulations!!!"
+echo "Execute $supervisor_file_path whenever you are ready to deploy your project. :)"
